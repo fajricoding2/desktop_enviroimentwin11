@@ -9,6 +9,35 @@ curl -fsSL https://raw.githubusercontent.com/fajricoding2/desktop_enviroimentwin
 
 ---
 
+## Prasyarat (baca ini kalau muncul `command not found`)
+
+Perintah di atas butuh **`curl`**, dan Debian versi *base/minimal* **tidak**
+memasang `curl`. Kalau muncul `bash: curl: command not found` atau
+`command not found`, pasang dulu:
+
+```bash
+# Debian / Ubuntu / Mint / Pop!_OS
+sudo apt update && sudo apt install -y curl ca-certificates
+
+# Arch Linux (biasanya sudah ada)
+sudo pacman -Sy --needed curl
+```
+
+Lalu ulangi perintah pemasangan di atas. Cek cepat:
+
+```bash
+command -v curl bash    # harus menampilkan dua path
+```
+
+Sisa paket (sddm, xfce4-panel, python3-pyqt6, imagemagick, thunar, …)
+dipasang otomatis oleh `install.sh` — tidak perlu disiapkan manual.
+
+> Di Debian yang masih memakai **GNOME/GDM3**: setelah instalasi, pilih sesi
+> **XFCE** di layar login. Bila SDDM belum menjadi display manager default:
+> `sudo dpkg-reconfigure sddm`.
+
+---
+
 ## Yang dipasang
 
 | Bagian | Isi |
@@ -97,6 +126,29 @@ placeholder `ganti-dengan` tertinggal. Exit code `0` = semua lulus.
 > `apps/*/wordcraft`, `artcraft-launcher`, `mission-center` saat ini berupa
 > **placeholder** yang menjalankan aplikasi bawaan sistem. Ganti dengan binary
 > asli bila sudah tersedia — installer menyalinnya apa adanya ke `~/.local/bin`.
+
+---
+
+## Troubleshooting
+
+| Gejala | Sebab | Solusi |
+|---|---|---|
+| `curl: command not found` | `curl` belum terpasang (khas Debian minimal) | `sudo apt install -y curl ca-certificates` |
+| `Failed to fetch` saat `apt update` | indeks paket basi / repo belum aktif | `sudo apt update` lalu ulangi |
+| Instalasi berhenti di paket tertentu | paket wajib gagal dipasang | lihat baris `[ERR]`, pasang manual paket itu, ulangi perintah |
+| Setelah reboot masih GDM3 | SDDM belum jadi display manager default | `sudo dpkg-reconfigure sddm` lalu pilih `sddm` |
+| Taskbar belum Win11 | sesi yang dipakai bukan XFCE, atau panel belum dimuat ulang | logout → pilih sesi **XFCE**; atau `xfce4-panel -r` |
+| Menu Start tidak muncul | `python3-gi` belum ada | `sudo apt install -y python3-gi` (Debian) / `sudo pacman -S python-gobject` (Arch) |
+| Klik-kanan Thunar tidak ada "Ubah layar login" | `uca.xml` belum dibuat Thunar | buka Thunar sekali, lalu `login-look install-menu` |
+| Layar login tidak berubah | greeter belum dimuat ulang | logout/reboot (bukan restart sesi) |
+
+Cek hasil instalasi kapan saja:
+
+```bash
+ls -l ~/.local/bin/login-look ~/.local/bin/win11-start-daemon
+sudo test -f /usr/share/sddm/themes/win11sddm/Main.qml && echo "tema OK"
+grep -c "login-look:" /usr/share/sddm/themes/win11sddm/Main.qml   # harus 3
+```
 
 ---
 
