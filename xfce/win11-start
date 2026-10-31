@@ -1,0 +1,10 @@
+#!/bin/sh
+PIDF=/tmp/win11-start-daemon.pid
+if [ -r "$PIDF" ]; then
+  P=$(cat "$PIDF")
+  if [ -n "$P" ] && tr '\0' ' ' < "/proc/$P/cmdline" 2>/dev/null | grep -q win11-start-daemon; then
+    kill -USR1 "$P"
+    exit 0
+  fi
+fi
+nohup "$HOME/.local/bin/win11-start-daemon" --show >/dev/null 2>&1 &

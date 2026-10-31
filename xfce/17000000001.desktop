@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Start
+Comment=Menu Start Win11
+Exec=win11-start
+Icon=start-here
+Terminal=false
+StartupNotify=false

@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+import os, sys, time, signal, atexit, subprocess, shlex
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gtk, Gdk, Gio, GLib, Pango
+try:
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except Exception:
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+PID = "/tmp/win11-start.pid"
+STAMP = "/tmp/win11-start.closed"
+W, H = 660, 700
+
+# Daftar aplikasi Pinned (ID file .desktop). Edit sesuai selera.
+PINNED = [
+    "google-chrome.desktop", "firefox.desktop", "thunar.desktop",
+    "xfce4-terminal.desktop", "org.xfce.mousepad.desktop", "code.desktop",
+    "xfce-settings-manager.desktop", "login-look-gui.desktop", "org.xfce.screenshooter.desktop",
+    "org.xfce.ristretto.desktop", "xfce4-taskmanager.desktop", "vlc.desktop",
+    "libreoffice-writer.desktop", "libreoffice-calc.desktop", "gimp.desktop",
+    "arduino.desktop", "xfce4-appfinder.desktop",
+]
+
+# ---------- daemon: satu proses tetap hidup, menu hanya di-show/hide ----------
+SHOW = "--show" in sys.argv
+PID = "/tmp/win11-start-daemon.pid"
+
+def is_ours(pid):
+    try:
+        return b"win11-start-daemon" in open("/proc/%d/cmdline" % pid, "rb").read()
+    except OSError:
+        return False
+
+try:
+    old = int(open(PID).read().strip())
+    if old != os.getpid() and is_ours(old):
+        if SHOW:
+            os.kill(old, signal.SIGUSR1)
+        sys.exit(0)
+except (OSError, ValueError):
+    pass
+open(PID, "w").write(str(os.getpid()))
+
+def cleanup():
+    try:
+        os.remove(PID)
+    except OSError:
+        pass
+atexit.register(cleanup)
+
+# ---------- data ----------
+def load_apps():
+    seen, out = set(), []
+    for a in Gio.AppInfo.get_all():
+        try:
+            if not a.should_show():
+                continue
+        except Exception:
+            continue
+        n = a.get_name()
+        if not n or n.lower() in seen:
+            continue
+        seen.add(n.lower())
+        out.append(a)
+    out.sort(key=lambda a: a.get_name().lower())
+    return out
+
+APPS = load_apps()
+
+def pinned_apps():
+    res, ids = [], set()
+    for did in PINNED:
+        try:
+            a = DesktopAppInfo.new(did)
+        except TypeError:
+            a = None
+        if a and a.should_show() and a.get_id() not in ids:
+            res.append(a)
+            ids.add(a.get_id())
+    for a in APPS:
+        if len(res) >= 12:
+            break
+        if a.get_id() not in ids:
+            res.append(a)
+            ids.add(a.get_id())
+    return res[:18]
+
+def recents(n=6):
+    out = []
+    try:
+        for i in Gtk.RecentManager.get_default().get_items():
+            if i.get_uri().startswith("file://") and i.exists():
+                out.append(i)
+    except Exception:
+        pass
+    out.sort(key=lambda i: i.get_modified(), reverse=True)
+    return out[:n]
+
+def ago(ts):
+    d = time.time() - ts
+    if d < 3600:
+        return "%dm ago" % max(1, int(d // 60))
+    if d < 86400:
+        return "%dh ago" % int(d // 3600)
+    if d < 172800:
+        return "Yesterday"
+    return "%dd ago" % int(d // 86400)
+
+def match(a, q):
+    parts = [a.get_name() or "", a.get_description() or ""]
+    try:
+        parts.append(a.get_generic_name() or "")
+        parts.append(" ".join(a.get_keywords() or []))
+    except Exception:
+        pass
+    return q in " ".join(parts).lower()
+
+def quit_soon():
+    hide_menu()
+
+def run(app):
+    try:
+        ctx = Gdk.Display.get_default().get_app_launch_context()
+        app.launch([], ctx)
+    except Exception:
+        pass
+    quit_soon()
+
+def open_uri(uri):
+    try:
+        Gio.AppInfo.launch_default_for_uri(uri, None)
+    except Exception:
+        pass
+    quit_soon()
+
+def icon_of(gicon, size, fallback="application-x-executable"):
+    img = Gtk.Image.new_from_gicon(gicon or Gio.ThemedIcon.new(fallback), Gtk.IconSize.DIALOG)
+    img.set_pixel_size(size)
+    return img
+
+# ---------- CSS ----------
+CSS = b"""
+window#start { background: transparent; box-shadow: none; border: none; }
+window#start decoration { box-shadow: none; margin: 0; border: none; background: transparent; }
+* { font-family: "Inter", "Segoe UI", "Noto Sans", sans-serif; color: #1b1b1b; }
+#panel { background-color: rgba(243,243,243,0.97); border: 1px solid rgba(0,0,0,0.10);
+         border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,0.30); margin: 10px; }
+window.nocomp #panel { margin: 0; border-radius: 0; box-shadow: none; }
+entry#search { background-color: #ffffff; border: 1px solid rgba(0,0,0,0.08);
+               border-bottom: 2px solid #0067c0; border-radius: 4px; min-height: 36px;
+               padding: 0 10px; box-shadow: none; }
+.sec { font-size: 11pt; font-weight: 600; }
+.pill { background-color: rgba(255,255,255,0.75); border: 1px solid rgba(0,0,0,0.07);
+        border-radius: 4px; padding: 2px 10px; font-size: 9pt; box-shadow: none; min-height: 0; }
+.pill:hover { background-color: #ffffff; }
+button.tile, button.rec { background: transparent; border: none; box-shadow: none;
+                          border-radius: 4px; padding: 6px 2px; }
+button.tile:hover, button.rec:hover { background-color: rgba(0,0,0,0.05); }
+button.tile label { font-size: 9pt; }
+button.rec label { font-size: 9.5pt; }
+label.recsub { font-size: 8pt; color: #5d5d5d; }
+label.muted { color: #6b6b6b; font-size: 9.5pt; }
+list { background: transparent; }
+row { border-radius: 4px; padding: 5px 8px; }
+row:hover { background-color: rgba(0,0,0,0.05); }
+row:selected { background-color: rgba(0,103,192,0.14); }
+scrolledwindow { background: transparent; border: none; }
+#footer { background-color: rgba(228,228,228,0.75); border-top: 1px solid rgba(0,0,0,0.07);
+          border-radius: 0 0 8px 8px; padding: 0 28px; min-height: 64px; }
+label.avatar { background-color: #8a8a8e; color: #ffffff; border-radius: 16px;
+               min-width: 32px; min-height: 32px; font-weight: 600; }
+button.power { background: transparent; border: none; box-shadow: none;
+               border-radius: 4px; padding: 8px 10px; }
+button.power:hover { background-color: rgba(0,0,0,0.06); }
+"""
+
+# ---------- jendela ----------
+win = Gtk.Window()
+win.set_name("start")
+win.set_decorated(False)
+win.set_skip_taskbar_hint(True)
+win.set_skip_pager_hint(True)
+win.set_keep_above(True)
+win.set_resizable(False)
+win.set_size_request(W, H)
+win.set_app_paintable(True)
+screen = win.get_screen()
+vis = screen.get_rgba_visual()
+if vis is not None and screen.is_composited():
+    win.set_visual(vis)
+else:
+    win.get_style_context().add_class("nocomp")
+prov = Gtk.CssProvider()
+prov.load_from_data(CSS)
+Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+VERT, HORZ = Gtk.Orientation.VERTICAL, Gtk.Orientation.HORIZONTAL
+
+panel = Gtk.Box(orientation=VERT)
+panel.set_name("panel")
+win.add(panel)
+
+body = Gtk.Box(orientation=VERT)
+body.set_border_width(30)
+body.set_vexpand(True)
+panel.pack_start(body, True, True, 0)
+
+entry = Gtk.Entry()
+entry.set_name("search")
+entry.set_placeholder_text("Type here to search")
+entry.set_icon_from_icon_name(Gtk.EntryIconPosition.PRIMARY, "system-search-symbolic")
+body.pack_start(entry, False, False, 0)
+
+stack = Gtk.Stack()
+stack.set_margin_top(20)
+stack.set_vexpand(True)
+body.pack_start(stack, True, True, 0)
+
+# --- halaman home ---
+home = Gtk.Box(orientation=VERT)
+
+def header(title, label):
+    b = Gtk.Box(orientation=HORZ)
+    l = Gtk.Label(label=title, xalign=0)
+    l.get_style_context().add_class("sec")
+    b.pack_start(l, True, True, 0)
+    btn = Gtk.Button(label=label)
+    btn.set_relief(Gtk.ReliefStyle.NONE)
+    btn.get_style_context().add_class("pill")
+    b.pack_end(btn, False, False, 0)
+    return b, btn
+
+phead, all_btn = header("Pinned", "All apps  \u203a")
+home.pack_start(phead, False, False, 0)
+
+grid = Gtk.Grid()
+grid.set_column_homogeneous(True)
+grid.set_margin_top(10)
+for idx, a in enumerate(pinned_apps()):
+    b = Gtk.Button()
+    b.set_relief(Gtk.ReliefStyle.NONE)
+    b.get_style_context().add_class("tile")
+    b.set_size_request(96, 86)
+    vb = Gtk.Box(orientation=VERT, spacing=6)
+    vb.set_valign(Gtk.Align.CENTER)
+    vb.pack_start(icon_of(a.get_icon(), 32), False, False, 0)
+    lbl = Gtk.Label(label=a.get_name())
+    lbl.set_ellipsize(Pango.EllipsizeMode.END)
+    lbl.set_max_width_chars(12)
+    vb.pack_start(lbl, False, False, 0)
+    b.add(vb)
+    b.connect("clicked", lambda _b, app=a: run(app))
+    b.connect("button-press-event", lambda w, ev, app=a: right_click(w, ev, app))
+    grid.attach(b, idx % 6, idx // 6, 1, 1)
+home.pack_start(grid, False, False, 0)
+
+rhead, more_btn = header("Recommended", "More  \u203a")
+rhead.set_margin_top(22)
+home.pack_start(rhead, False, False, 0)
+more_btn.connect("clicked", lambda _b: (subprocess.Popen(["thunar", "recent:///"]), quit_soon()))
+
+rg = Gtk.Grid()
+rg.set_column_homogeneous(True)
+rg.set_margin_top(10)
+def refresh_recents():
+    for c in rg.get_children():
+        rg.remove(c)
+    rs = recents(6)
+    if not rs:
+        nl = Gtk.Label(label="No recent files yet", xalign=0)
+        nl.get_style_context().add_class("muted")
+        rg.attach(nl, 0, 0, 1, 1)
+    for idx, info in enumerate(rs):
+        b = Gtk.Button()
+        b.set_relief(Gtk.ReliefStyle.NONE)
+        b.get_style_context().add_class("rec")
+        b.set_size_request(280, 50)
+        hb = Gtk.Box(orientation=HORZ, spacing=12)
+        hb.set_halign(Gtk.Align.START)
+        hb.pack_start(icon_of(info.get_gicon(), 28, "text-x-generic"), False, False, 0)
+        vb = Gtk.Box(orientation=VERT)
+        vb.set_valign(Gtk.Align.CENTER)
+        n = Gtk.Label(label=info.get_display_name(), xalign=0)
+        n.set_ellipsize(Pango.EllipsizeMode.END)
+        n.set_max_width_chars(26)
+        s = Gtk.Label(label=ago(info.get_modified()), xalign=0)
+        s.get_style_context().add_class("recsub")
+        vb.pack_start(n, False, False, 0)
+        vb.pack_start(s, False, False, 0)
+        hb.pack_start(vb, False, False, 0)
+        b.add(hb)
+        b.connect("clicked", lambda _b, u=info.get_uri(): open_uri(u))
+        rg.attach(b, idx // 3, idx % 3, 1, 1)
+    rg.show_all()
+home.pack_start(rg, False, False, 0)
+refresh_recents()
+stack.add_named(home, "home")
+
+# --- halaman daftar (All apps + hasil pencarian) ---
+all_list = Gtk.ListBox()
+all_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+items = []
+sw = Gtk.ScrolledWindow()
+sw.set_min_content_height(300)
+sw.add(all_list)
+stack.add_named(sw, "list")
+
+def mkrow(a):
+    r = Gtk.ListBoxRow()
+    b = Gtk.Box(orientation=HORZ, spacing=12)
+    b.set_border_width(2)
+    b.pack_start(icon_of(a.get_icon(), 24), False, False, 0)
+    b.pack_start(Gtk.Label(label=a.get_name(), xalign=0), True, True, 0)
+    r.add(b)
+    r.connect("button-press-event", lambda w, ev, app=a: right_click(w, ev, app))
+    return r
+
+def refresh_list(q):
+    for c in all_list.get_children():
+        all_list.remove(c)
+    q = q.strip().lower()
+    if q:
+        found = [a for a in APPS if match(a, q)]
+        found.sort(key=lambda a: (not a.get_name().lower().startswith(q), a.get_name().lower()))
+    else:
+        found = list(APPS)
+    items[:] = found[:300]
+    for a in items:
+        all_list.add(mkrow(a))
+    all_list.show_all()
+    first = all_list.get_row_at_index(0)
+    if first:
+        all_list.select_row(first)
+
+state = {"all": False}
+
+def update():
+    q = entry.get_text()
+    if q.strip() or state["all"]:
+        refresh_list(q)
+        stack.set_visible_child_name("list")
+    else:
+        stack.set_visible_child_name("home")
+    all_btn.set_label("\u2039  Back" if state["all"] else "All apps  \u203a")
+
+def on_all(_b):
+    state["all"] = not state["all"]
+    update()
+
+all_btn.connect("clicked", on_all)
+entry.connect("changed", lambda _e: update())
+all_list.connect("row-activated", lambda lb, r: run(items[r.get_index()]))
+
+def on_activate(_e):
+    if stack.get_visible_child_name() == "list":
+        r = all_list.get_selected_row() or all_list.get_row_at_index(0)
+        if r:
+            run(items[r.get_index()])
+
+entry.connect("activate", on_activate)
+
+def on_entry_key(_e, ev):
+    if ev.keyval == Gdk.KEY_Down and stack.get_visible_child_name() == "list":
+        r = all_list.get_selected_row() or all_list.get_row_at_index(0)
+        if r:
+            all_list.select_row(r)
+            r.grab_focus()
+            return True
+    return False
+
+entry.connect("key-press-event", on_entry_key)
+
+# --- footer ---
+footer = Gtk.Box(orientation=HORZ, spacing=12)
+footer.set_name("footer")
+name = GLib.get_real_name()
+if not name or name == "Unknown":
+    name = GLib.get_user_name()
+av = Gtk.Label(label=name[:1].upper())
+av.get_style_context().add_class("avatar")
+av.set_valign(Gtk.Align.CENTER)
+nl = Gtk.Label(label=name)
+nl.set_valign(Gtk.Align.CENTER)
+footer.pack_start(av, False, False, 0)
+footer.pack_start(nl, False, False, 0)
+pw = Gtk.Button()
+pw.set_relief(Gtk.ReliefStyle.NONE)
+pw.get_style_context().add_class("power")
+pw.add(Gtk.Image.new_from_icon_name("system-shutdown-symbolic", Gtk.IconSize.LARGE_TOOLBAR))
+pw.set_valign(Gtk.Align.CENTER)
+footer.pack_end(pw, False, False, 0)
+panel.pack_end(footer, False, False, 0)
+
+# ---------- fokus, menu power, penutupan ----------
+guard = {"menu": False, "seen": False, "m": None}
+
+def check_close():
+    if not win.is_active() and not guard["menu"]:
+        hide_menu()
+    return False
+
+def power_menu(btn):
+    m = Gtk.Menu()
+    guard["m"] = m
+    entries = [("Sleep", ["systemctl", "suspend"]), ("Shut down", ["systemctl", "poweroff"]),
+               ("Restart", ["systemctl", "reboot"]), None,
+               ("Lock", ["xflock4"]), ("Sign out", ["xfce4-session-logout", "--logout"])]
+    for e in entries:
+        if e is None:
+            m.append(Gtk.SeparatorMenuItem())
+            continue
+        mi = Gtk.MenuItem(label=e[0])
+        def go(_mi, cmd=e[1]):
+            subprocess.Popen(cmd)
+            quit_soon()
+        mi.connect("activate", go)
+        m.append(mi)
+    def done(*_a):
+        guard["menu"] = False
+        GLib.timeout_add(250, check_close)
+    m.connect("deactivate", done)
+    guard["menu"] = True
+    m.show_all()
+    m.popup_at_widget(btn, Gdk.Gravity.NORTH_EAST, Gdk.Gravity.SOUTH_EAST, None)
+
+pw.connect("clicked", power_menu)
+
+# ---------- klik kanan aplikasi: Open / Create shortcut ----------
+MK_SHORTCUT = os.path.expanduser("~/.local/bin/mk-shortcut")
+APP_DIRS = ("~/.local/share/applications", "/usr/local/share/applications",
+            "/usr/share/applications", "~/.local/share/flatpak/exports/share/applications",
+            "/var/lib/flatpak/exports/share/applications")
+
+def app_path(app):
+    """File .desktop asal aplikasi ini (untuk diserahkan ke mk-shortcut)."""
+    try:
+        f = app.get_filename()
+    except Exception:
+        f = None
+    if f:
+        return f
+    try:
+        aid = app.get_id()
+    except Exception:
+        return None
+    if not aid:
+        return None
+    for d in APP_DIRS:
+        p = os.path.join(os.path.expanduser(d), aid)
+        if os.path.exists(p):
+            return p
+    return aid
+
+def shortcut_source(app):
+    """Path yang diserahkan ke mk-shortcut.
+
+    Kalau entri .desktop menunjuk AppImage, serahkan AppImage-nya: mk-shortcut
+    lalu memilih entri .desktop terbaik (nama + ikon resmi) untuk AppImage itu,
+    bukan entri appimage-*.desktop yang generik.
+    """
+    p = app_path(app)
+    if not p or not p.endswith(".desktop"):
+        return p
+    try:
+        lines = open(p, encoding="utf-8", errors="replace").read().splitlines()
+    except OSError:
+        return p
+    val = next((l.split("=", 1)[1].strip() for l in lines if l.startswith("Exec=")), "")
+    try:
+        toks = shlex.split(val)
+    except ValueError:
+        toks = val.split()
+    for t in toks:
+        if t.startswith("%"):
+            continue
+        if os.path.isabs(t) and t.lower().endswith(".appimage") and os.path.exists(t):
+            return t
+        break
+    return p
+
+def create_shortcut(app):
+    target = shortcut_source(app)
+    if target:
+        try:
+            subprocess.Popen([MK_SHORTCUT, target])
+        except Exception:
+            pass
+    quit_soon()
+
+def app_menu(app, widget, ev=None):
+    m = Gtk.Menu()
+    guard["m"] = m
+    mi = Gtk.MenuItem(label="Open")
+    mi.connect("activate", lambda _m: run(app))
+    m.append(mi)
+    m.append(Gtk.SeparatorMenuItem())
+    mi = Gtk.MenuItem(label="Create shortcut")
+    mi.connect("activate", lambda _m: create_shortcut(app))
+    m.append(mi)
+    def done(*_a):
+        guard["menu"] = False
+        GLib.timeout_add(250, check_close)
+    m.connect("deactivate", done)
+    guard["menu"] = True
+    m.show_all()
+    m.popup_at_pointer(ev)
+
+def right_click(w, ev, app):
+    if ev.button != 3:
+        return False
+    app_menu(app, w, ev)
+    return True
+
+def on_active(w, _p):
+    if w.is_active():
+        guard["seen"] = True
+    elif guard["seen"]:
+        GLib.timeout_add(200, check_close)
+
+win.connect("notify::is-active", on_active)
+
+def on_key(_w, ev):
+    if ev.keyval == Gdk.KEY_Escape:
+        hide_menu()
+        return True
+    return False
+
+win.connect("key-press-event", on_key)
+win.connect("delete-event", lambda *_: (hide_menu(), True)[1])
+win.connect("destroy", lambda *_: Gtk.main_quit())
+
+def place():
+    d = Gdk.Display.get_default()
+    m = d.get_primary_monitor() or d.get_monitor(0)
+    wa = m.get_workarea()
+    win.move(wa.x + (wa.width - W) // 2, wa.y + wa.height - H)
+
+def refocus():
+    if not guard["seen"]:
+        win.present()
+        entry.grab_focus()
+    return False
+
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: (Gtk.main_quit(), False)[1])
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, lambda: (Gtk.main_quit(), False)[1])
+
+def apps_mtime():
+    try:
+        return os.path.getmtime("/usr/share/applications")
+    except OSError:
+        return 0
+
+APPS_MTIME = {"t": apps_mtime()}
+
+def hide_menu():
+    if win.get_visible():
+        win.hide()
+        state["hid"] = time.time()
+
+def show_menu():
+    global APPS
+    t = apps_mtime()
+    if t != APPS_MTIME["t"]:
+        APPS_MTIME["t"] = t
+        APPS = load_apps()
+    guard["seen"] = False
+    guard["menu"] = False
+    state["all"] = False
+    entry.set_text("")
+    refresh_recents()
+    update()
+    place()
+    win.show()
+    place()
+    win.present()
+    entry.grab_focus()
+    GLib.timeout_add(300, refocus)
+
+def toggle():
+    if win.get_visible():
+        hide_menu()
+    elif time.time() - state.get("hid", 0) > 0.5:
+        show_menu()
+
+def on_usr1():
+    toggle()
+    return True
+
+GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, on_usr1)
+
+win.show_all()
+stack.set_visible_child_name("home")
+win.hide()
+if SHOW:
+    show_menu()
+Gtk.main()
