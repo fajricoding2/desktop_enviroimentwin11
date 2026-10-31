@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Placeholder launcher untuk Wordcraft.
+# Ganti berkas ini dengan binary/sebenarnya aplikasi Wordcraft Anda.
+exec /usr/bin/leafpad 2>/dev/null || echo "Wordcraft belum tersedia. Pasang binary di ~/.local/bin/wordcraft"

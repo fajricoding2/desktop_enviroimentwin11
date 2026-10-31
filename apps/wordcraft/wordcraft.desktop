@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Wordcraft
+Comment=Aplikasi pengolah kata
+Exec=wordcraft
+Icon=wordcraft
+Terminal=false
+Type=Application
+Categories=Office;WordProcessor;
+X-Login-Look-App=1

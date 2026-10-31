@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Placeholder launcher untuk Mission Center.
+# Ganti berkas ini dengan binary/sebenarnya aplikasi Mission Center Anda.
+exec /usr/bin/xfce4-taskmanager 2>/dev/null || echo "Mission Center belum tersedia. Pasang binary di ~/.local/bin/mission-center"

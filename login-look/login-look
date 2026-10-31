@@ -1,0 +1,736 @@
+#!/usr/bin/env python3
+"""login-look — ganti wallpaper & avatar layar login SDDM tema win11sddm.
+
+Inti dari menu "Pengaturan Layar Login". Semua logika di sini; GUI hanya
+membungkus perintah-perintah ini.
+
+Pemakaian:
+  login-look status [--json]
+  login-look bg PATH
+  login-look avatar PATH
+  login-look reset [bg|avatar|all]
+  login-look preview [--state lock|login] [--out FILE]
+  login-look theme-dir
+
+Opsi global: --theme DIR (default $LOGIN_LOOK_THEME atau tema win11sddm),
+--no-notify.
+
+Exit code: 0 sukses, 1 salah pakai, 2 bukan gambar valid, 3 tema tidak bisa
+ditulis / belum dipasang, 4 pratinjau layar kata sandi gagal.
+"""
+import json
+import os
+import pathlib
+import shlex
+import subprocess
+import sys
+
+DEFAULT_THEME = pathlib.Path("/usr/share/sddm/themes/win11sddm")
+BLOCK_MARKER = "# Login-look: wallpaper & avatar pilihan user (ubah lewat login-look / menu)"
+CONF_KEYS = ("background", "avatar")
+PATCH_MARKERS = ("login-look: background", "login-look: avatar", "login-look: fallback")
+
+
+def theme_dir():
+    """Folder tema: $LOGIN_LOOK_THEME bila ada, kalau tidak tema bawaan."""
+    env = os.environ.get("LOGIN_LOOK_THEME")
+    return pathlib.Path(env) if env else DEFAULT_THEME
+
+
+def parse_conf(text):
+    """Ambil semua pasangan key=value flat; komentar hanya bila diawali '#'."""
+    out = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def split_block(text):
+    """Pisahkan blok login-look di akhir file -> (teks_tanpa_blok, nilai_blok)."""
+    lines = text.splitlines(keepends=True)
+    # cari baris terakhir yang persis marker
+    idx = None
+    for i, line in enumerate(lines):
+        if line.strip() == BLOCK_MARKER:
+            idx = i
+    if idx is None:
+        return text, {}
+    values = {}
+    end = idx + 1
+    while end < len(lines):
+        stripped = lines[end].strip()
+        if not stripped:
+            end += 1
+            continue
+        if "=" not in stripped:
+            break
+        key, _, value = stripped.partition("=")
+        if key.strip() not in CONF_KEYS:
+            break
+        values[key.strip()] = value.strip()
+        end += 1
+    body = "".join(lines[:idx]) + "".join(lines[end:])
+    return body, values
+
+
+def _newline_of(text):
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _render(body, values, newline):
+    if not values:
+        return body
+    block = [BLOCK_MARKER + newline]
+    for key in CONF_KEYS:
+        if values.get(key):
+            block.append("%s=%s%s" % (key, values[key], newline))
+    if len(block) == 1:  # tidak ada nilai sama sekali
+        return body
+    if body and not body.endswith(newline):
+        body += newline
+    return body + "".join(block)
+
+
+def set_conf(path, updates):
+    """Tulis blok login-look secara atomik; None berarti hapus kunci itu.
+
+    Hanya kunci 'background' dan 'avatar' yang boleh ada di updates.
+    """
+    unknown = set(updates) - set(CONF_KEYS)
+    if unknown:
+        raise ValueError("kunci tidak dikenal: %s" % ", ".join(sorted(unknown)))
+    path = pathlib.Path(path)
+    if path.is_symlink():
+        # theme.conf boleh symlink ke assets/custom/theme.conf (milik user).
+        # os.replace di bawah akan mengganti symlink itu dengan file biasa kalau
+        # kita menulis ke path symlink-nya, jadi tulis ke target aslinya.
+        path = pathlib.Path(os.path.realpath(path))
+    text = path.read_bytes().decode("utf-8")
+    newline = _newline_of(text)
+    body, values = split_block(text)
+    for key, value in updates.items():
+        if value is None:
+            values.pop(key, None)
+        else:
+            values[key] = value
+    new_text = _render(body, values, newline)
+    mode = path.stat().st_mode & 0o777
+    tmp = path.with_name(path.name + ".login-look.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(new_text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def patch_markers_present(theme):
+    """True bila Main.qml memuat ketiga penanda tambalan login-look."""
+    qml = pathlib.Path(theme) / "Main.qml"
+    try:
+        text = qml.read_text("utf-8", errors="replace")
+    except OSError:
+        return False
+    return all(marker in text for marker in PATCH_MARKERS)
+
+
+def writable(theme):
+    """True bila theme.conf tema ada dan bisa ditulis."""
+    conf = pathlib.Path(theme) / "theme.conf"
+    return conf.is_file() and os.access(conf, os.W_OK)
+
+
+def status(theme):
+    """Ringkasan keadaan tema untuk CLI & GUI."""
+    theme = pathlib.Path(theme)
+    conf = theme / "theme.conf"
+    try:
+        values = split_block(conf.read_text("utf-8"))[1]
+    except OSError:
+        values = {}
+
+    def exists(rel):
+        if not rel:
+            return False
+        return (theme / rel).is_file()
+
+    return {
+        "theme_dir": str(theme),
+        "patched": patch_markers_present(theme),
+        "writable": writable(theme),
+        "theme_conf": str(conf),
+        "background": values.get("background") or None,
+        "avatar": values.get("avatar") or None,
+        "background_exists": exists(values.get("background")),
+        "avatar_exists": exists(values.get("avatar")),
+    }
+
+
+class InvalidImage(Exception):
+    """File bukan gambar yang bisa dibaca ImageMagick."""
+
+
+def image_format(path):
+    """Format gambar menurut ImageMagick (mis. 'JPEG'); raise InvalidImage."""
+    path = pathlib.Path(path)
+    if not path.is_file():
+        raise InvalidImage("file tidak ditemukan: %s" % path)
+    proc = subprocess.run(
+        ["magick", "identify", "-format", "%m", str(path)],
+        capture_output=True, text=True)
+    fmt = proc.stdout.strip()
+    if proc.returncode != 0 or not fmt:
+        reason = (proc.stderr or "").strip().splitlines()
+        detail = reason[0] if reason else "format tidak dikenali"
+        raise InvalidImage("bukan gambar yang valid: %s (%s)" % (path.name, detail))
+    return fmt
+
+
+def custom_dir(theme):
+    """Folder gambar pilihan user di dalam tema."""
+    return pathlib.Path(theme) / "assets/custom"
+
+
+def _ensure_writable(conf):
+    conf = pathlib.Path(conf)
+    if not conf.is_file():
+        raise PermissionError("theme.conf tidak ditemukan: %s" % conf)
+    if not os.access(conf, os.W_OK):
+        raise PermissionError(
+            "tema tidak bisa ditulis: %s\n"
+            "Jalankan ulang: sudo bash ~/.local/src/login-look/setup.sh" % conf)
+
+
+def _run_magick(args):
+    proc = subprocess.run(args, capture_output=True, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()
+        raise InvalidImage("gagal mengolah gambar: %s"
+                           % (detail[0] if detail else "ImageMagick error"))
+
+
+def normalize_wallpaper(src, dst):
+    """Jadikan JPEG sRGB tanpa alpha, sisi terpanjang <= 3840 px."""
+    dst = pathlib.Path(dst)
+    tmp = dst.with_name(".login-look-%s.tmp" % dst.stem)
+    try:
+        _run_magick([
+            "magick", str(src), "-auto-orient", "-colorspace", "sRGB",
+            "-background", "black", "-alpha", "remove", "-alpha", "off",
+            "-resize", "3840x3840>", "-strip", "-quality", "92",
+            "JPEG:" + str(tmp),
+        ])
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def normalize_avatar(src, dst):
+    """Jadikan PNG persegi 512x512 (potong tengah)."""
+    dst = pathlib.Path(dst)
+    tmp = dst.with_name(".login-look-%s.tmp" % dst.stem)
+    try:
+        _run_magick([
+            "magick", str(src), "-auto-orient", "-colorspace", "sRGB",
+            "-resize", "512x512^", "-gravity", "center", "-extent", "512x512",
+            "-strip", "PNG:" + str(tmp),
+        ])
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _remove_stale(folder, stem, keep):
+    """Hapus file lain dengan nama dasar sama (mis. bg.png lama)."""
+    for old in pathlib.Path(folder).glob("%s.*" % stem):
+        if old != keep:
+            old.unlink()
+
+
+def set_wallpaper(theme, src):
+    """Simpan wallpaper pilihan user; kembalikan path relatif untuk theme.conf."""
+    theme = pathlib.Path(theme)
+    image_format(src)
+    conf = theme / "theme.conf"
+    _ensure_writable(conf)
+    folder = custom_dir(theme)
+    folder.mkdir(parents=True, exist_ok=True)
+    dst = folder / "bg.jpg"
+    normalize_wallpaper(src, dst)
+    _remove_stale(folder, "bg", dst)
+    set_conf(conf, {"background": "assets/custom/bg.jpg"})
+    return "assets/custom/bg.jpg"
+
+
+def set_avatar(theme, src):
+    """Simpan avatar pilihan user; kembalikan path relatif untuk theme.conf."""
+    theme = pathlib.Path(theme)
+    image_format(src)
+    conf = theme / "theme.conf"
+    _ensure_writable(conf)
+    folder = custom_dir(theme)
+    folder.mkdir(parents=True, exist_ok=True)
+    dst = folder / "avatar.png"
+    normalize_avatar(src, dst)
+    _remove_stale(folder, "avatar", dst)
+    set_conf(conf, {"avatar": "assets/custom/avatar.png"})
+    return "assets/custom/avatar.png"
+
+
+def clear(theme, what):
+    """Kembalikan ke bawaan: hapus kunci dulu, baru file."""
+    if what not in ("bg", "avatar", "all"):
+        raise ValueError("pilihan harus bg, avatar, atau all")
+    theme = pathlib.Path(theme)
+    conf = theme / "theme.conf"
+    _ensure_writable(conf)
+    updates = {}
+    if what in ("bg", "all"):
+        updates["background"] = None
+    if what in ("avatar", "all"):
+        updates["avatar"] = None
+    set_conf(conf, updates)
+    folder = custom_dir(theme)
+    if folder.is_dir():
+        stems = []
+        if what in ("bg", "all"):
+            stems.append("bg")
+        if what in ("avatar", "all"):
+            stems.append("avatar")
+        for stem in stems:
+            for old in folder.glob("%s.*" % stem):
+                old.unlink()
+
+
+DESKTOP_NAME = "login-look-gui.desktop"
+DAEMON_NAME = "win11-start-daemon"
+UCA_UNIQUE_ID = "login-look-menu-1"
+
+# Daftar aplikasi tambahan yang dipasang ke PINNED list
+PINNED_APPS = [
+    "wordcraft.desktop",
+    "artcraft-launcher.desktop",
+    "mission-center.desktop",
+]
+
+
+def desktop_content():
+    """Isi berkas .desktop untuk entri menu login-look-gui."""
+    return (
+        "[Desktop Entry]\n"
+        "Name=Pengaturan Layar Login\n"
+        "Comment=Ubah wallpaper dan avatar layar login SDDM\n"
+        "Exec=login-look-gui\n"
+        "Icon=preferences-desktop-wallpaper\n"
+        "Terminal=false\n"
+        "Type=Application\n"
+        "Categories=Settings;DesktopSettings;\n"
+        "X-Login-Look=1\n"
+    )
+
+
+def _home_dirs(home):
+    """Kembalikan path penting di bawah $HOME (bisa di-mock dalam tes)."""
+    return {
+        "desktop": home / ".local/share/applications",
+        "daemon": home / ".local/bin" / DAEMON_NAME,
+        "uca": home / ".config/Thunar" / "uca.xml",
+        "uca_dir": home / ".config/Thunar",
+        "uca_backup": home / ".config/Thunar" / "uca.xml.login-look.bak",
+    }
+
+
+def patch_daemon_pinned(daemon):
+    """Tambahkan login-look-gui.desktop dan aplikasi tambahan ke PINNED."""
+    text = daemon.read_text(encoding="utf-8")
+    anchor = '"xfce-settings-manager.desktop",'
+    if anchor not in text:
+        raise OSError("PINNED list tidak dikenal di %s" % daemon)
+
+    # Tambahkan login-look-gui.desktop setelah anchor
+    if DESKTOP_NAME not in text:
+        text = text.replace(
+            anchor,
+            anchor + ' "%s",' % DESKTOP_NAME, 1)
+
+    # Tambahkan aplikasi tambahan setelah login-look-gui.desktop
+    marker = '"%s",' % DESKTOP_NAME
+    for app in PINNED_APPS:
+        if app not in text:
+            if marker in text:
+                text = text.replace(
+                    marker,
+                    marker + ' "%s",' % app, 1)
+            else:
+                text = text.replace(
+                    anchor,
+                    anchor + ' "%s",' % app, 1)
+
+    daemon.write_text(text, encoding="utf-8")
+
+
+def unpatch_daemon_pinned(daemon):
+    """Hapus login-look-gui dan aplikasi tambahan dari PINNED."""
+    text = daemon.read_text(encoding="utf-8")
+    text = text.replace(' "%s",' % DESKTOP_NAME, "")
+    for app in PINNED_APPS:
+        text = text.replace(' "%s",' % app, "")
+    daemon.write_text(text, encoding="utf-8")
+
+
+def add_thunar_action(uca_file):
+    """Sisipkan action login-look ke uca.xml sebelum </actions>."""
+    text = uca_file.read_text(encoding="utf-8")
+    if UCA_UNIQUE_ID in text:
+        return  # sudah ada
+    marker = "</actions>"
+    if marker not in text:
+        raise OSError("uca.xml tidak memiliki penutup </actions>")
+    action_xml = "\n" + DESKTOP_ACTION_TEMPLATE.strip() + "\n"
+    text = text.replace(marker, action_xml + marker, 1)
+    uca_file.write_text(text, encoding="utf-8")
+
+
+def remove_thunar_action(uca_file):
+    """Hapus action login-look dari uca.xml."""
+    text = uca_file.read_text(encoding="utf-8")
+    # hapus blok action yang mengandung UCA_UNIQUE_ID
+    lines = text.splitlines(keepends=True)
+    out = []
+    skipping = False
+    for line in lines:
+        if UCA_UNIQUE_ID in line:
+            skipping = True
+            continue
+        if skipping:
+            if line.strip() == "</action>":
+                skipping = False
+                continue
+            continue
+        out.append(line)
+    uca_file.write_text("".join(out), encoding="utf-8")
+
+
+DESKTOP_ACTION_TEMPLATE = """	<action>
+		<icon>preferences-desktop-wallpaper</icon>
+		<name>Ubah layar login</name>
+		<submenu></submenu>
+		<unique-id>login-look-menu-1</unique-id>
+		<command>login-look-gui</command>
+		<description>Buka Pengaturan Layar Login</description>
+		<patterns>*</patterns>
+		<startup-notify/>
+	</action>"""
+
+
+def install_menu():
+    """Pasang entri menu: .desktop, PINNED daemon, Thunar UCA."""
+    home = pathlib.Path.home()
+    d = _home_dirs(home)
+
+    # 1. .desktop file
+    d["desktop"].mkdir(parents=True, exist_ok=True)
+    desktop_file = d["desktop"] / DESKTOP_NAME
+    desktop_file.write_text(desktop_content(), encoding="utf-8")
+    os.chmod(desktop_file, 0o644)
+
+    # 2. Patch win11-start-daemon PINNED list
+    if d["daemon"].is_file():
+        patch_daemon_pinned(d["daemon"])
+
+    # 3. Thunar UCA (simpan cadangan asli sekali)
+    d["uca_dir"].mkdir(parents=True, exist_ok=True)
+    if d["uca"].is_file() and not d["uca_backup"].exists():
+        d["uca_backup"].write_bytes(d["uca"].read_bytes())
+    if d["uca"].is_file():
+        add_thunar_action(d["uca"])
+
+    print("menu login-look dipasang")
+    return 0
+
+
+def remove_menu():
+    """Cabut entri menu yang dipasang install-menu."""
+    home = pathlib.Path.home()
+    d = _home_dirs(home)
+
+    # 1. Hapus .desktop
+    desktop_file = d["desktop"] / DESKTOP_NAME
+    desktop_file.unlink(missing_ok=True)
+
+    # 2. Revert PINNED list
+    if d["daemon"].is_file():
+        unpatch_daemon_pinned(d["daemon"])
+
+    # 3. Revert Thunar UCA dari cadangan
+    if d["uca"].is_file() and d["uca_backup"].exists():
+        d["uca"].write_bytes(d["uca_backup"].read_bytes())
+        d["uca_backup"].unlink()
+
+    print("menu login-look dihapus")
+    return 0
+
+
+USAGE = __doc__.split("Pemakaian:")[1].split("Opsi global:")[0].strip()
+
+
+def _parse(argv):
+    """Parser manual: --theme diterima di mana saja. Returns (cmd, args, opts)."""
+    args, opts = [], {"theme": None, "json": False, "notify": True,
+                      "state": "lock", "out": None, "seconds": None}
+    argv = list(argv)[1:]
+    i = 0
+    takes_value = {"--theme": "theme", "--state": "state", "--out": "out",
+                   "--seconds": "seconds"}
+    while i < len(argv):
+        arg = argv[i]
+        if arg in takes_value:
+            if i + 1 >= len(argv):
+                raise SystemExit("opsi %s butuh nilai" % arg)
+            opts[takes_value[arg]] = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--json":
+            opts["json"] = True
+        elif arg == "--no-notify":
+            opts["notify"] = False
+        elif arg in ("-h", "--help"):
+            opts["help"] = True
+        else:
+            args.append(arg)
+        i += 1
+    return (args[0] if args else None), args[1:], opts
+
+
+def _theme(opts):
+    return pathlib.Path(opts["theme"]) if opts["theme"] else theme_dir()
+
+
+def _notify(opts, title, body):
+    """Notifikasi desktop, best-effort (tidak pernah menggagalkan perintah)."""
+    if not opts.get("notify", True):
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "Login Look", title, body],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+GREETER = "sddm-greeter-qt6"
+
+
+def greeter_argv():
+    """Perintah greeter asli; $LOGIN_LOOK_PREVIEW_CMD menimpanya (untuk tes)."""
+    override = os.environ.get("LOGIN_LOOK_PREVIEW_CMD")
+    if override:
+        return shlex.split(override)
+    return [GREETER, "--test-mode"]
+
+
+def press_shift():
+    """Suntik satu tekan-lepas Shift_L ke display aktif (libXtst)."""
+    import ctypes
+    import time
+
+    x11 = ctypes.CDLL("libX11.so.6")
+    xtst = ctypes.CDLL("libXtst.so.6")
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XKeysymToKeycode.restype = ctypes.c_ubyte
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xtst.XTestFakeKeyEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                       ctypes.c_int, ctypes.c_ulong]
+    xtst.XTestFakeKeyEvent.restype = ctypes.c_int
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("tidak bisa membuka display X (DISPLAY=%s)"
+                           % os.environ.get("DISPLAY", ""))
+    try:
+        keycode = x11.XKeysymToKeycode(display, 0xFFE1)  # Shift_L
+        if not keycode:
+            raise RuntimeError("keycode Shift tidak ditemukan")
+        xtst.XTestFakeKeyEvent(display, keycode, 1, 0)
+        x11.XFlush(display)
+        time.sleep(0.05)
+        xtst.XTestFakeKeyEvent(display, keycode, 0, 0)
+        x11.XFlush(display)
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def frames_differ(a, b, threshold=0.01):
+    """True bila dua gambar berbeda lebih dari `threshold` (RMSE 0..1)."""
+    import re
+    proc = subprocess.run(
+        ["magick", "compare", "-metric", "RMSE", str(a), str(b), "null:"],
+        capture_output=True, text=True)
+    if proc.returncode not in (0, 1):  # 1 = berbeda, masih valid
+        raise RuntimeError((proc.stderr or "magick compare gagal").strip())
+    text = (proc.stderr or "").strip()
+    match = re.search(r"\(([0-9.eE+-]+)\)", text) or re.search(r"([0-9.eE+-]+)", text)
+    if not match:
+        raise RuntimeError("tidak bisa membaca RMSE: %r" % text)
+    return float(match.group(1)) > threshold
+
+
+def _capture(out):
+    out = pathlib.Path(out)
+    proc = subprocess.run(["import", "-window", "root", str(out)],
+                          capture_output=True, text=True)
+    if proc.returncode != 0 or not out.is_file():
+        detail = (proc.stderr or "").strip().splitlines()
+        raise RuntimeError("gagal menangkap layar: %s"
+                           % (detail[0] if detail else "import error"))
+
+
+def preview(out, state="lock", seconds=8):
+    """Jalankan greeter asli, tangkap layarnya, lalu matikan greeter."""
+    import time
+
+    if state not in ("lock", "login"):
+        raise ValueError("state harus 'lock' atau 'login'")
+    out = pathlib.Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    before = out.with_name(out.stem + ".before" + out.suffix)
+    argv = greeter_argv()
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        raise RuntimeError("tidak bisa menjalankan greeter (%s): %s"
+                           % (argv[0], exc))
+    try:
+        time.sleep(max(3, seconds - 2))    # beri waktu greeter siap
+        _capture(before)
+        if state == "login":
+            press_shift()
+            time.sleep(2)                  # animasi transisi
+        _capture(out)
+    finally:
+        proc.terminate()
+        try:
+            _, err = proc.communicate(timeout=6)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+        for line in (err or "").splitlines():
+            if line.strip() and "pseudo-class" not in line:
+                print(line, file=sys.stderr)
+
+    if state == "login" and not frames_differ(before, out):
+        out.unlink(missing_ok=True)
+        raise RuntimeError("pratinjau hanya layar kunci: transisi tidak terjadi")
+    return out
+
+
+def main(argv):
+    try:
+        cmd, args, opts = _parse(argv)
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if opts.get("help") or cmd is None:
+        print(USAGE)
+        return 0
+
+    theme = _theme(opts)
+
+    if cmd == "theme-dir":
+        print(theme)
+        return 0
+
+    if cmd == "status":
+        st = status(theme)
+        if opts["json"]:
+            print(json.dumps(st, indent=2))
+        else:
+            print("tema        : %s" % st["theme_dir"])
+            print("tambalan QML: %s" % ("ada" if st["patched"] else "BELUM"))
+            print("bisa ditulis: %s" % ("ya" if st["writable"] else "tidak"))
+            print("wallpaper   : %s" % (st["background"] or "(bawaan: acak)"))
+            print("avatar      : %s" % (st["avatar"] or "(bawaan tema)"))
+        return 0
+
+    if cmd in ("bg", "avatar"):
+        if not args:
+            print("%s: butuh path gambar" % cmd, file=sys.stderr)
+            return 1
+        src = pathlib.Path(args[0])
+        try:
+            if cmd == "bg":
+                rel = set_wallpaper(theme, src)
+                print("wallpaper layar login diganti: %s" % rel)
+                title, body = "Wallpaper layar login", "Wallpaper diganti."
+            else:
+                rel = set_avatar(theme, src)
+                print("avatar layar login diganti: %s" % rel)
+                title, body = "Avatar layar login", "Avatar diganti."
+        except InvalidImage as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except (PermissionError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+        _notify(opts, title, body)
+        print("berlaku pada greeter berikutnya (logout/reboot).")
+        return 0
+
+    if cmd == "preview":
+        state = opts["state"]
+        if state not in ("lock", "login"):
+            print("preview: --state harus lock atau login", file=sys.stderr)
+            return 1
+        out = pathlib.Path(opts["out"] or "/tmp/login-look-preview.png")
+        try:
+            preview(out, state, int(opts.get("seconds") or 8))
+        except (RuntimeError, ValueError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
+        print(str(out))
+        return 0
+
+    if cmd == "install-menu":
+        try:
+            return install_menu()
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+
+    if cmd == "remove-menu":
+        try:
+            return remove_menu()
+        except OSError as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+
+    if cmd == "reset":
+        what = args[0] if args else "all"
+        if what not in ("bg", "avatar", "all"):
+            print("reset: pilihan harus bg, avatar, atau all", file=sys.stderr)
+            return 1
+        try:
+            clear(theme, what)
+        except (PermissionError, OSError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 3
+        print("dikembalikan ke bawaan: %s" % what)
+        return 0
+
+    print("perintah tidak dikenal: %s" % cmd, file=sys.stderr)
+    print(USAGE)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

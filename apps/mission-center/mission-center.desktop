@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Mission Center
+Comment=Pusat misaan dan tugas
+Exec=mission-center
+Icon=mission-center
+Terminal=false
+Type=Application
+Categories=System;TaskManager;
+X-Login-Look-App=1

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Artcraft Launcher
+Comment=Peluncur aplikasi Artcraft
+Exec=artcraft-launcher
+Icon=artcraft-launcher
+Terminal=false
+Type=Application
+Categories=System;Launcher;
+X-Login-Look-App=1

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Placeholder launcher untuk Artcraft Launcher.
+# Ganti berkas ini dengan binary/sebenarnya aplikasi Artcraft Launcher Anda.
+exec /usr/bin/xfce4-appfinder 2>/dev/null || echo "Artcraft Launcher belum tersedia. Pasang binary di ~/.local/bin/artcraft-launcher"
