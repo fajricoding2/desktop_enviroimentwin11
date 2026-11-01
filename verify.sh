@@ -25,7 +25,7 @@ THEME_SHA="${THEME_SHA:-d10502f278bf43ed8d24c73df3deef28db0264c7}"
 THEME_TARBALL_URL="${THEME_TARBALL_URL:-https://github.com/abhinand128/win11sddm/archive/${THEME_SHA}.tar.gz}"
 
 MODE="remote"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 LOCAL_DIR="$HERE"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
